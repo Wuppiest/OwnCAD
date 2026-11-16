@@ -9,7 +9,8 @@ import { regenerate, type RegenResult } from './kernel/regenerate';
 import { Viewport } from './view/viewport';
 import { ViewCube } from './view/viewcube';
 import { SketchEditor, type SketchTool } from './sketch/editor';
-import { frameFromPlane, ORIGIN_ID, toLocal } from './sketch/geom';
+import { frameFromPlane, ORIGIN_ID, toLocal, toWorld } from './sketch/geom';
+import { findRegions } from './sketch/profiles';
 import { NumericInput } from './ui/numericInput';
 import { icon } from './ui/icons';
 import { renderTree } from './ui/tree';
@@ -130,7 +131,23 @@ export class App {
     this.vp.setSketches(list);
   }
 
+  /** Shows clickable sketch regions while an extrude/revolve is selected. */
+  private updateRegionOverlay() {
+    const f = this.selectedFeature ? this.store.feature(this.selectedFeature) : null;
+    if (this.mode !== 'model' || !f || (f.type !== 'extrude' && f.type !== 'revolve')) {
+      this.vp.setRegions(null, [], new Set(), false);
+      return;
+    }
+    const s = this.store.sketch(f.sketch);
+    const frame = s && this.result?.frames.get(s.id);
+    if (!s || !frame) return this.vp.setRegions(null, [], new Set(), false);
+    const sk = f.type === 'revolve' ? { ...s, curves: s.curves.filter((c) => c.id !== f.axis) } : s;
+    const regions = findRegions(sk);
+    this.vp.setRegions(frame, regions, new Set(f.profiles ?? []), !f.profiles?.length);
+  }
+
   renderPanels() {
+    this.updateRegionOverlay();
     renderTree(this, document.getElementById('tree-panel')!);
     renderProps(this, document.getElementById('props-panel')!);
     renderParams(this, document.getElementById('params-panel')!);
@@ -148,10 +165,12 @@ export class App {
     canvas.addEventListener('pointermove', (e) => this.onPointerMove(e));
     window.addEventListener('pointerup', (e) => this.editor?.onPointerUp(e));
     canvas.addEventListener('dblclick', (e) => this.onDoubleClick(e));
-    window.addEventListener('keydown', (e) => this.onKey(e));
-    window.addEventListener('beforeunload', (e) => {
-      if (this.store.dirty && this.store.doc.features.length) e.preventDefault();
+    canvas.addEventListener('pointerleave', () => {
+      this.hoverHit = null;
+      if (this.mode === 'pickPlane') this.vp.highlightFace(null);
     });
+    window.addEventListener('keydown', (e) => this.onKey(e));
+    // (no "leave page?" prompt: the model is autosaved continuously)
 
     document.querySelectorAll<HTMLButtonElement>('.panel-tabs button').forEach((b) =>
       b.addEventListener('click', () => {
@@ -194,18 +213,18 @@ export class App {
 
   // ============================================================ ribbon
 
-  private ribbonButtons(): { group: string; items: Btn[] }[] {
+  private ribbonButtons(): { group: string; items: Btn[]; compact?: boolean; iconOnly?: boolean }[] {
     if (this.mode === 'sketch') {
       const t = (id: SketchTool, label: string, ic = id as string, title?: string): Btn => ({
         id, label, icon: ic, title, run: () => this.editor?.setTool(id), active: () => this.editor?.tool === id,
       });
       const c = (id: any, label: string, title?: string): Btn => ({ id, label, icon: id, title, run: () => this.editor?.applyConstraint(id) });
       return [
-        { group: 'Create', items: [t('select', 'Select', 'select', 'Select (Esc)'), t('line', 'Line', 'line', 'Line (L)'), t('rect', 'Rectangle', 'rect', 'Rectangle (R)'), t('centerRect', 'Center Rect', 'centerRect'), t('circle', 'Circle', 'circle', 'Circle (C)'), t('arc', 'Arc', 'arc', 'Center arc (A)'), t('arc3', '3-Pt Arc', 'arc3'), t('polygon', 'Polygon', 'polygon'), t('point', 'Point', 'point', 'Point (P)')] },
-        { group: 'Modify', items: [t('fillet', 'Fillet', 'fillet'), t('project', 'Project', 'project', 'Project model edges'), c('construction', 'Construct', 'Toggle construction (X)'), { id: 'del', label: 'Delete', icon: 'delete', run: () => this.editor?.deleteSelection(), title: 'Delete (Del)' }] },
-        { group: 'Constrain', items: [t('dimension', 'Dimension', 'dimension', 'Dimension (D)'), c('coincident', 'Coincident'), c('horizontal', 'Horizontal', 'Horizontal (H)'), c('vertical', 'Vertical', 'Vertical (V)'), c('parallel', 'Parallel'), c('perpendicular', 'Perpend.'), c('equal', 'Equal', 'Equal (E)'), c('tangent', 'Tangent', 'Tangent (T)'), c('midpoint', 'Midpoint'), c('symmetric', 'Symmetric'), c('concentric', 'Concentric'), c('fix', 'Fix', 'Fix / unfix')] },
-        { group: 'Edit', items: [{ id: 'undo', label: 'Undo', icon: 'undo', run: () => this.undo(), enabled: () => this.store.canUndo() }, { id: 'redo', label: 'Redo', icon: 'redo', run: () => this.redo(), enabled: () => this.store.canRedo() }, { id: 'look', label: 'Look At', icon: 'lookat', run: () => this.lookAtSketch() }] },
-        { group: 'Finish', items: [{ id: 'finish', label: 'Finish Sketch', icon: 'finish', cls: 'finish', run: () => this.exitSketch() }] },
+        { group: 'Finish', items: [{ id: 'finish', label: 'Finish', icon: 'finish', cls: 'finish', run: () => this.exitSketch(), title: 'Finish sketch (Enter when idle)' }] },
+        { group: 'Create', items: [t('select', 'Select', 'select', 'Select (Esc)'), t('line', 'Line', 'line', 'Line (L)'), t('rect', 'Rect', 'rect', 'Rectangle (R)'), t('centerRect', 'Ctr Rect', 'centerRect', 'Center rectangle'), t('circle', 'Circle', 'circle', 'Circle (C)'), t('arc', 'Arc', 'arc', 'Center arc (A)'), t('arc3', '3-Pt Arc', 'arc3', '3-point arc'), t('polygon', 'Polygon', 'polygon'), t('point', 'Point', 'point', 'Point (P)'), t('dimension', 'Dimension', 'dimension', 'Dimension (D)')] },
+        { group: 'Modify', compact: true, items: [t('trim', 'Trim', 'trim', 'Trim (T)'), t('fillet', 'Fillet', 'fillet', 'Sketch fillet (F)'), { id: 'mirror', label: 'Mirror', icon: 'mirror', run: () => this.editor?.mirrorSelection(), title: 'Mirror selected curves about a line (M)' }, t('project', 'Project', 'project', 'Project model edges'), c('construction', 'Construct', 'Toggle construction (X)'), { id: 'del', label: 'Delete', icon: 'delete', run: () => this.editor?.deleteSelection(), title: 'Delete (Del)' }] },
+        { group: 'Constrain', compact: true, iconOnly: true, items: [c('coincident', 'Coincident', 'Coincident / point on curve'), c('horizontal', 'Horizontal', 'Horizontal (H)'), c('vertical', 'Vertical', 'Vertical (V)'), c('parallel', 'Parallel'), c('perpendicular', 'Perpendicular'), c('equal', 'Equal', 'Equal (E)'), c('tangent', 'Tangent'), c('midpoint', 'Midpoint'), c('symmetric', 'Symmetric (2 points + line)'), c('concentric', 'Concentric'), c('fix', 'Fix', 'Fix / unfix')] },
+        { group: 'Edit', compact: true, items: [{ id: 'undo', label: 'Undo', icon: 'undo', run: () => this.undo(), enabled: () => this.store.canUndo(), title: 'Undo (Ctrl+Z)' }, { id: 'redo', label: 'Redo', icon: 'redo', run: () => this.redo(), enabled: () => this.store.canRedo(), title: 'Redo (Ctrl+Y)' }, { id: 'look', label: 'Look At', icon: 'lookat', run: () => this.lookAtSketch(), title: 'Look at sketch plane' }, { id: 'help', label: 'Help', icon: 'help', run: () => this.showHelp(), title: 'Shortcuts' }] },
       ];
     }
     if (this.tab === 'file') {
@@ -239,7 +258,7 @@ export class App {
         ] },
         { group: 'Display', items: [
           { id: 'ortho', label: 'Orthographic', icon: 'ortho', run: () => this.toggleProjection(), active: () => this.vp.isOrtho },
-          { id: 'grid', label: 'Grid', icon: 'grid', run: () => { this.vp.grid.visible = !this.vp.grid.visible; this.renderRibbonState(); }, active: () => this.vp.grid.visible },
+          { id: 'grid', label: 'Grid', icon: 'grid', run: () => { this.vp.setGridVisible(!this.vp.gridVisible); this.renderRibbonState(); }, active: () => this.vp.gridVisible },
           { id: 'sk', label: 'Sketches', icon: 'sketch', run: () => { this.showSketches = !this.showSketches; this.refreshSketchDisplay(); this.renderRibbonState(); }, active: () => this.showSketches },
         ] },
       ];
@@ -296,13 +315,13 @@ export class App {
     this.btnIndex.clear();
     for (const g of this.ribbonButtons()) {
       const gEl = document.createElement('div');
-      gEl.className = 'rgroup';
+      gEl.className = 'rgroup' + (g.compact ? ' compact' : '') + (g.iconOnly ? ' icon-only' : '');
       const items = document.createElement('div');
       items.className = 'rgroup-items';
       for (const b of g.items) {
         const el = document.createElement('button');
         el.className = 'rbtn ' + (b.cls ?? '');
-        el.innerHTML = `${icon(b.icon)}<span>${b.label}</span>`;
+        el.innerHTML = g.iconOnly ? icon(b.icon) : `${icon(b.icon)}<span>${b.label}</span>`;
         el.title = b.title ?? b.label;
         el.addEventListener('click', () => b.run());
         items.appendChild(el);
@@ -392,10 +411,26 @@ export class App {
 
   // ============================================================ pointer handling
 
+  private downAt: { x: number; y: number } | null = null;
+  private hoverHit: ReturnType<Viewport['pickBody']> = null;
+  private newSketchId: string | null = null;
+
   private onPointerDown(e: PointerEvent) {
     if (this.gizmo?.dragging || (this.gizmo?.enabled && this.gizmo.axis)) return;
     if (this.mode === 'sketch') return this.editor?.onPointerDown(e);
     if (e.button !== 0) return;
+    // In model mode a left drag orbits; only a click (no movement) selects.
+    this.downAt = { x: e.clientX, y: e.clientY };
+    const up = (u: PointerEvent) => {
+      window.removeEventListener('pointerup', up);
+      const d = this.downAt;
+      this.downAt = null;
+      if (d && Math.hypot(u.clientX - d.x, u.clientY - d.y) < 5) this.onClick(u);
+    };
+    window.addEventListener('pointerup', up);
+  }
+
+  private onClick(e: PointerEvent) {
     if (this.mode === 'pickPlane') {
       const plane = this.vp.pickPlane(e);
       const hit = this.vp.pickBody(e);
@@ -411,6 +446,22 @@ export class App {
       return;
     }
     if (this.mode === 'measure') return this.measureClick(e);
+    // toggle profile regions of the selected extrude/revolve
+    const region = this.vp.pickRegion(e);
+    if (region !== null && this.selectedFeature) {
+      const f = this.store.feature(this.selectedFeature);
+      if (f && (f.type === 'extrude' || f.type === 'revolve')) {
+        const s = this.store.sketch(f.sketch);
+        const n = s ? findRegions(s).length : 0;
+        const cur = new Set(f.profiles?.length ? f.profiles : Array.from({ length: n }, (_, i) => i));
+        if (cur.has(region)) cur.delete(region);
+        else cur.add(region);
+        if (!cur.size) return this.toast('At least one profile must stay selected', 'err');
+        const list = [...cur].sort((a, b) => a - b);
+        this.updateFeature(f.id, (x) => (x.profiles = list.length === n ? undefined : list));
+        return;
+      }
+    }
     // model selection
     const hit = this.vp.pickBody(e);
     if (hit) {
@@ -436,7 +487,9 @@ export class App {
       this.setCoords(`x ${fmt(m[0], 2)}   y ${fmt(m[1], 2)}  mm`);
       return;
     }
+    if (this.downAt) return; // orbiting
     const hit = this.vp.pickBody(e);
+    this.hoverHit = hit;
     if (this.mode === 'pickPlane') {
       this.vp.highlightFace(hit && hit.planar ? hit : null);
     } else if (this.mode === 'measure') {
@@ -490,7 +543,7 @@ export class App {
         return;
       }
       const map: Record<string, () => void> = {
-        escape: () => ed.escape(),
+        escape: () => { ed.escape(); this.renderRibbonState(); },
         delete: () => ed.deleteSelection(),
         backspace: () => ed.deleteSelection(),
         l: () => ed.setTool('line'),
@@ -503,7 +556,9 @@ export class App {
         h: () => ed.applyConstraint('horizontal'),
         v: () => ed.applyConstraint('vertical'),
         e: () => ed.applyConstraint('equal'),
-        t: () => ed.applyConstraint('tangent'),
+        t: () => ed.setTool('trim'),
+        m: () => ed.mirrorSelection(),
+        enter: () => { if (ed.tool === 'select' || !ed.busy) this.exitSketch(); },
         g: () => { this.settings.snapGrid = !this.settings.snapGrid; this.renderStatus(); },
         f: () => this.vp.fitAll(),
       };
@@ -558,12 +613,26 @@ export class App {
     this.mode = m;
     this.vp.showOriginPlanes(m === 'pickPlane');
     this.vp.highlightFace(null);
-    const banner = document.getElementById('sketch-banner')!;
-    banner.classList.toggle('hidden', m === 'model');
-    if (m === 'pickPlane') banner.textContent = 'Select a plane or a planar face for the new sketch · Esc to cancel';
-    if (m === 'measure') banner.textContent = 'Measure: click two points (vertices snap) · Esc to exit';
+    this.vp.setLeftOrbit(m !== 'sketch');
+    if (m !== 'model') this.vp.setRegions(null, [], new Set(), false);
+    if (m === 'model') this.setBanner(null);
+    if (m === 'pickPlane') this.setBanner('Click a plane or a flat face for the new sketch · Esc to cancel');
+    if (m === 'measure') this.setBanner('Measure: click two points (vertices snap) · Esc to exit');
     if (m === 'model') this.status('');
     this.renderRibbonState();
+  }
+
+  private setBanner(text: string | null, finish = false) {
+    const banner = document.getElementById('sketch-banner')!;
+    banner.classList.toggle('hidden', text === null);
+    banner.textContent = text ?? '';
+    if (finish) {
+      const b = document.createElement('button');
+      b.className = 'banner-btn';
+      b.textContent = '✓ Finish Sketch';
+      b.addEventListener('click', () => this.exitSketch());
+      banner.appendChild(b);
+    }
   }
 
   view(name: 'iso' | 'front' | 'top' | 'right') {
@@ -581,7 +650,16 @@ export class App {
 
   startNewSketch() {
     if (this.mode === 'sketch') return;
+    // pressing S while hovering a flat face sketches directly on it
+    const h = this.hoverHit;
+    if (this.mode === 'model' && h && h.planar) return this.sketchOnFace(h);
     this.setMode('pickPlane');
+  }
+
+  private sketchOnFace(hit: NonNullable<App['hoverHit']>) {
+    const frame = frameFromPlane([hit.point.x, hit.point.y, hit.point.z], [hit.normal.x, hit.normal.y, hit.normal.z]);
+    const body = this.result?.bodies.find((b) => b.id === hit.bodyId);
+    this.createSketch({ kind: 'custom', frame, label: `Face of ${body?.name ?? 'body'}`, offset: '0' });
   }
 
   private createSketch(plane: SketchFeature['plane']) {
@@ -595,6 +673,7 @@ export class App {
       this.store.insertFeature(doc, s);
     });
     this.regen();
+    this.newSketchId = id;
     this.enterSketch(id, true);
   }
 
@@ -614,8 +693,7 @@ export class App {
       return;
     }
     this.setMode('sketch');
-    document.getElementById('sketch-banner')!.textContent = `Editing ${s.name}`;
-    document.getElementById('sketch-banner')!.classList.remove('hidden');
+    this.setBanner(`Editing ${s.name}`, true);
     this.selectedFeature = id;
     this.vp.selectedBodies.clear();
     this.vp.setBodyOpacity(0.35);
@@ -644,30 +722,41 @@ export class App {
 
   exitSketch() {
     if (!this.editor) return;
+    const id = this.editor.id;
+    const empty = this.editor.sketch && this.editor.sketch.curves.length === 0 && this.editor.sketch.points.length <= 1;
     this.editor.dispose();
     this.editor = null;
     this.vp.setBodyOpacity(1);
     this.setMode('model');
+    // a freshly created sketch that was left empty is removed again
+    if (empty && this.newSketchId === id) {
+      this.store.commit('delete-feature', (doc) => {
+        const idx = doc.features.findIndex((f) => f.id === id);
+        if (idx >= 0) doc.features.splice(idx, 1);
+        if (doc.rollback !== null && idx >= 0 && idx < doc.rollback) doc.rollback--;
+      });
+      if (this.selectedFeature === id) this.selectedFeature = null;
+    }
+    this.newSketchId = null;
     this.updateGridForMode();
     this.renderRibbon();
     this.regen();
   }
 
+  /** Orients the camera onto the sketch plane and frames its contents. */
   lookAtSketch() {
     const id = this.editor?.id ?? this.selectedFeature;
     const f = id ? this.result?.frames.get(id) : undefined;
     if (!f) return;
-    this.vp.setView(new THREE.Vector3(...f.z), new THREE.Vector3(...f.y));
+    const b = this.editor?.contentBounds() ?? { center: [0, 0] as [number, number], radius: 50 };
+    this.vp.setView(new THREE.Vector3(...f.z), new THREE.Vector3(...f.y), true, {
+      center: new THREE.Vector3(...toWorld(f, b.center)),
+      radius: Math.max(b.radius * 1.3, 20),
+    });
   }
 
   private updateGridForMode() {
-    const step = this.settings.gridStep;
-    const major = step * 10;
-    const size = Math.max(200, major * 20);
-    const frame = this.editor ? this.editor.frame : undefined;
-    const visible = this.vp.grid.visible;
-    this.vp.setGrid(size, major, frame);
-    this.vp.grid.visible = visible;
+    this.vp.setGrid(this.editor ? this.editor.frame : undefined);
   }
 
   // ============================================================ feature creation
@@ -1016,10 +1105,10 @@ export class App {
 
   showHelp() {
     const rows = [
-      ['Right mouse drag', 'Orbit'], ['Middle mouse drag', 'Pan'], ['Mouse wheel', 'Zoom (to cursor)'],
-      ['S', 'New sketch'], ['E', 'Extrude'], ['M', 'Move/Copy'], ['F', 'Fit all'], ['0 / 1 / 2 / 3', 'Home / Front / Top / Right view'], ['5', 'Toggle orthographic'],
+      ['Left drag', 'Orbit (in sketch mode: right drag)'], ['Middle drag / Shift + left drag', 'Pan'], ['Mouse wheel', 'Zoom (to cursor)'],
+      ['S', 'New sketch (on the face under the mouse, if any)'], ['E', 'Extrude'], ['M', 'Move/Copy'], ['F', 'Fit all'], ['0 / 1 / 2 / 3', 'Home / Front / Top / Right view'], ['5', 'Toggle orthographic'],
       ['Ctrl+Z / Ctrl+Y', 'Undo / Redo'], ['Ctrl+S / Ctrl+O', 'Save / Open project'], ['Del', 'Delete selection'], ['Esc', 'Cancel / deselect'],
-      ['— Sketch —', ''], ['L R C A P', 'Line, Rectangle, Circle, Arc, Point'], ['D', 'Dimension'], ['H / V / E / T', 'Horizontal / Vertical / Equal / Tangent'],
+      ['— Sketch —', ''], ['L R C A P', 'Line, Rectangle, Circle, Arc, Point'], ['D', 'Dimension'], ['T / M', 'Trim / Mirror selection'], ['H / V / E', 'Horizontal / Vertical / Equal'], ['Enter', 'Finish sketch (when no tool is busy)'],
       ['X', 'Toggle construction'], ['G', 'Toggle grid snap'], ['Shift (while drawing)', 'Orthogonal line'], ['Type a number', 'Exact length / size (Tab switches fields, Enter confirms)'],
       ['Double-click dimension', 'Edit value (expressions & parameters allowed, e.g. width/2)'], ['Ctrl+A', 'Select all'],
     ];

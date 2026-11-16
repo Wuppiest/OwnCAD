@@ -6,6 +6,7 @@ import { DIMENSION_TYPES } from '../model/types';
 import { fmt } from '../model/expr';
 import { escapeHtml } from './tree';
 import { arcAngles, dist, P, pointMap } from '../sketch/geom';
+import { findRegions } from '../sketch/profiles';
 
 type Opt = { value: string; label: string };
 
@@ -204,7 +205,7 @@ export function renderProps(app: App, el: HTMLElement) {
     form.info(
       `<b>Getting started</b><br>1. Click <b>Sketch</b> (S) and pick a plane.<br>2. Draw a closed shape — type numbers for exact sizes.<br>` +
         `3. Add dimensions (D) — use parameters like <code>width</code>.<br>4. <b>Finish Sketch</b>, then <b>Extrude</b> (E).<br>5. Sketch on a face of the body to add more features.<br><br>` +
-        `<b>Mouse</b>: right-drag orbit · middle-drag pan · wheel zoom.`,
+        `<b>Mouse</b>: left-drag orbit (right-drag while sketching) · middle-drag or Shift+drag pan · wheel zoom.<br>Press <b>S</b> while hovering a flat face to sketch on it.`,
     );
     form.buttons([{ label: 'Keyboard shortcuts', run: () => app.showHelp() }]);
     return;
@@ -225,6 +226,19 @@ export function renderProps(app: App, el: HTMLElement) {
   const bodyOpts = bodiesBefore.map((b) => ({ value: b.id, label: b.name }));
   const targetOpts = [{ value: 'auto', label: 'Automatic' }, ...bodyOpts];
   const sketches = app.store.doc.features.slice(0, idx).filter((x): x is SketchFeature => x.type === 'sketch').map((s) => ({ value: s.id, label: s.name }));
+
+  const profilePicker = (sketchId: string, profiles: number[] | undefined, axis?: string) => {
+    const s = app.store.sketch(sketchId);
+    if (!s) return;
+    const regions = findRegions(axis ? { ...s, curves: s.curves.filter((c) => c.id !== axis) } : s);
+    if (regions.length < 2) return;
+    const all = regions.map((_, i) => String(i));
+    form.multi('Profiles', profiles?.length ? profiles.map(String) : all, regions.map((r, i) => ({ value: String(i), label: `Region ${i + 1} (${fmt(r.area, 1)} mm²)` })), (v) => {
+      if (!v.length) return app.toast('At least one profile must stay selected', 'err');
+      upd((x) => (x.profiles = v.length === regions.length ? undefined : v.map(Number)));
+    });
+    form.info('Tip: click the shaded regions in the viewport to toggle them. With all selected, inner loops become holes.');
+  };
 
   switch (f.type) {
     case 'sketch': {
@@ -251,6 +265,7 @@ export function renderProps(app: App, el: HTMLElement) {
       form.expr('Taper (scale)', f.taper ?? '1', (v) => upd((x) => (x.taper = v)));
       form.select('Operation', f.op, OPS, (v) => upd((x) => (x.op = v)));
       if (f.op !== 'new') form.select('Target body', f.target, targetOpts, (v) => upd((x) => (x.target = v)));
+      profilePicker(f.sketch, f.profiles);
       break;
     }
     case 'revolve': {
@@ -261,6 +276,7 @@ export function renderProps(app: App, el: HTMLElement) {
       form.expr('Angle', f.angle, (v) => upd((x) => (x.angle = v)), { unit: '°' });
       form.select('Operation', f.op, OPS, (v) => upd((x) => (x.op = v)));
       if (f.op !== 'new') form.select('Target body', f.target, targetOpts, (v) => upd((x) => (x.target = v)));
+      profilePicker(f.sketch, f.profiles, f.axis);
       form.info('Tip: draw a construction line in the sketch and choose it as the axis.');
       break;
     }
@@ -338,11 +354,7 @@ function renderSketchProps(app: App, el: HTMLElement, form: Form, head: (k: stri
     const isDim = DIMENSION_TYPES.includes(con.type);
     head(isDim ? 'Dimension' : 'Constraint', con.type);
     if (isDim) {
-      const inp = form.expr('Value', con.value ?? '0', (v) => ed.setConstraintValue(con.id, v), { unit: con.type === 'angle' ? '°' : 'mm' });
-      setTimeout(() => {
-        inp.focus();
-        inp.select();
-      }, 0);
+      form.expr('Value', con.value ?? '0', (v) => ed.setConstraintValue(con.id, v), { unit: con.type === 'angle' ? '°' : 'mm' });
       form.check('Reference (driven)', !!con.reference, () => ed.toggleReference(con.id));
       form.info('Use parameters and expressions, e.g. <code>width/2</code>.');
     }

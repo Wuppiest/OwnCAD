@@ -4,7 +4,7 @@ import type { CrossSection, Manifold, Vec2 as MVec2 } from 'manifold-3d';
 import type { BodyOp, CadDocument, Feature, Frame, SketchFeature, Vec2, Vec3 } from '../model/types';
 import { ParamScope } from '../model/expr';
 import { kernel } from './manifold';
-import { findProfiles } from '../sketch/profiles';
+import { findProfiles, findRegions } from '../sketch/profiles';
 import { solveSketch, type SolveResult } from '../sketch/solver';
 import { frameMatrix, offsetFrame, ORIGIN_FRAMES, pointMap } from '../sketch/geom';
 
@@ -88,7 +88,8 @@ export function regenerate(doc: CadDocument, opts: { skipSolve?: string } = {}):
     }
     if (op === 'cut') {
       if (bodies.size === 0) throw new Error('There is no body to cut');
-      const ids = target === 'auto' ? [...bodies.keys()] : [target];
+      const ids = target === 'auto' ? touching(tool) : [target];
+      if (!ids.length) throw new Error('The cut does not intersect any body');
       for (const id of ids) {
         const b = bodies.get(id);
         if (!b) throw new Error(`Target body not found`);
@@ -96,16 +97,50 @@ export function regenerate(doc: CadDocument, opts: { skipSolve?: string } = {}):
       }
       return;
     }
-    const id = target === 'auto' ? lastBody()! : target;
-    const b = bodies.get(id);
-    if (!b) throw new Error('Target body not found');
-    b.m = T(op === 'join' ? b.m.add(tool) : b.m.intersect(tool));
+    if (target !== 'auto') {
+      const b = bodies.get(target);
+      if (!b) throw new Error('Target body not found');
+      b.m = T(op === 'join' ? b.m.add(tool) : b.m.intersect(tool));
+      return;
+    }
+    // automatic: operate on the bodies the tool touches
+    const hits = touching(tool);
+    if (op === 'join') {
+      if (!hits.length) return newBody(f.id, tool, f.id);
+      const first = bodies.get(hits[0])!;
+      first.m = T(Manifold.union([first.m, tool, ...hits.slice(1).map((h) => bodies.get(h)!.m)]));
+      for (const h of hits.slice(1)) bodies.delete(h);
+      return;
+    }
+    if (!hits.length) throw new Error('The feature does not intersect any body');
+    for (const h of hits) {
+      const b = bodies.get(h)!;
+      b.m = T(b.m.intersect(tool));
+    }
   };
 
-  const profileSection = (s: SketchFeature): { cs: CrossSection; open: string[] } => {
+  /** Bodies whose bounding box overlaps or touches the tool's. */
+  const touching = (tool: Manifold): string[] => {
+    const tb = tool.boundingBox();
+    const eps = 1e-4;
+    return [...bodies].filter(([, b]) => {
+      const bb = b.m.boundingBox();
+      return [0, 1, 2].every((i) => bb.min[i] <= tb.max[i] + eps && tb.min[i] <= bb.max[i] + eps);
+    }).map(([id]) => id);
+  };
+
+  const profileSection = (s: SketchFeature, profiles?: number[]): { cs: CrossSection; open: string[] } => {
     const { loops, openCurveIds } = findProfiles(s);
     if (loops.length === 0) throw new Error('Sketch has no closed profile');
-    const cs = T(new CrossSection(loops as MVec2[][], 'EvenOdd'));
+    let cs: CrossSection;
+    if (profiles && profiles.length) {
+      const regions = findRegions(s);
+      const chosen = profiles.filter((i) => i >= 0 && i < regions.length);
+      if (!chosen.length) throw new Error('Selected profiles no longer exist — reselect them');
+      cs = T(CrossSection.union(chosen.map((i) => T(new CrossSection(regions[i].polys as MVec2[][], 'EvenOdd')))));
+    } else {
+      cs = T(new CrossSection(loops as MVec2[][], 'EvenOdd'));
+    }
     if (cs.isEmpty()) throw new Error('Sketch profile is empty');
     return { cs, open: openCurveIds };
   };
@@ -139,10 +174,16 @@ export function regenerate(doc: CadDocument, opts: { skipSolve?: string } = {}):
         case 'extrude': {
           const s = getSketch(f.sketch);
           const frame = frames.get(s.id)!;
-          const { cs, open } = profileSection(s);
+          const { cs, open } = profileSection(s, f.profiles);
           if (open.length) warnings.set(f.id, `${open.length} open curve(s) ignored`);
-          const h = E(f.distance, 'Distance');
-          if (h <= 0) throw new Error('Distance must be greater than 0');
+          let h = E(f.distance, 'Distance');
+          if (Math.abs(h) < 1e-9) throw new Error('Distance must not be 0');
+          let dir = f.direction;
+          if (h < 0) {
+            h = -h;
+            if (dir === 'normal') dir = 'reverse';
+            else if (dir === 'reverse') dir = 'normal';
+          }
           const taper = f.taper ? E(f.taper, 'Taper') : 1;
           let base = cs;
           let m: Manifold;
@@ -150,12 +191,12 @@ export function regenerate(doc: CadDocument, opts: { skipSolve?: string } = {}):
             const bb = cs.bounds();
             const c: MVec2 = [(bb.min[0] + bb.max[0]) / 2, (bb.min[1] + bb.max[1]) / 2];
             base = T(cs.translate([-c[0], -c[1]]));
-            m = T(base.extrude(h, 0, 0, [Math.max(0, taper), Math.max(0, taper)], f.direction === 'symmetric'));
+            m = T(base.extrude(h, 0, 0, [Math.max(0, taper), Math.max(0, taper)], dir === 'symmetric'));
             m = T(m.translate([c[0], c[1], 0]));
           } else {
-            m = T(cs.extrude(h, 0, 0, [1, 1], f.direction === 'symmetric'));
+            m = T(cs.extrude(h, 0, 0, [1, 1], dir === 'symmetric'));
           }
-          if (f.direction === 'reverse') m = T(m.mirror([0, 0, 1]));
+          if (dir === 'reverse') m = T(m.mirror([0, 0, 1]));
           m = T(m.transform(frameMatrix(frame) as any));
           applyOp(f, f.op, f.target, m);
           break;
@@ -178,7 +219,7 @@ export function regenerate(doc: CadDocument, opts: { skipSolve?: string } = {}):
           const e1: Vec2 = [d[1], -d[0]];
           // exclude the axis line itself from the profile
           const s2: SketchFeature = { ...s, curves: s.curves.filter((c) => c.id !== f.axis) };
-          const { loops } = findProfiles(s2);
+          const loops = profileSection(s2, f.profiles).cs.toPolygons() as Vec2[][];
           if (!loops.length) throw new Error('Sketch has no closed profile');
           let mapped = loops.map((loop) => loop.map(([x, y]) => [(x - P[0]) * e1[0] + (y - P[1]) * e1[1], (x - P[0]) * d[0] + (y - P[1]) * d[1]] as Vec2));
           const xs = mapped.flat().map((p) => p[0]);

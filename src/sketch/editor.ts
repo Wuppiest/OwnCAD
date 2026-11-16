@@ -11,7 +11,7 @@ import type { NumericInput } from '../ui/numericInput';
 import { solveSketch, type SolveOptions, type SolveResult } from './solver';
 import {
   add, arcAngles, closestOnSegment, dist, distanceToCurve, frameMatrix, intersections, len, norm, normAngle,
-  ORIGIN_ID, P, pointMap, scale, sub, TAU, toLocal, toWorld,
+  ORIGIN_ID, P, pointMap, scale, sub, TAU, tessellate, toLocal, toWorld,
 } from './geom';
 import { BADGE, badgeAnchor, COLORS, curvePoly, dimensionLayout, measure, pointsObject, polyLine } from './render';
 import { findProfiles } from './profiles';
@@ -19,7 +19,7 @@ import { kernel } from '../kernel/manifold';
 
 export type SketchTool =
   | 'select' | 'line' | 'rect' | 'centerRect' | 'circle' | 'arc' | 'arc3' | 'polygon' | 'point'
-  | 'fillet' | 'dimension' | 'project';
+  | 'fillet' | 'trim' | 'dimension' | 'project';
 
 type SnapKind = 'point' | 'mid' | 'intersection' | 'ref' | 'onCurve' | 'grid' | 'align' | 'free';
 interface Snap {
@@ -53,6 +53,7 @@ export const TOOL_HINTS: Record<SketchTool, string> = {
   polygon: 'Click the center, then a vertex. Type number of sides and radius.',
   point: 'Click to place a point.',
   fillet: 'Click a corner where two lines meet. Type the radius first.',
+  trim: 'Click the part of a curve you want to remove (between intersections).',
   dimension: 'Pick a line, circle, arc, two points, a point and a line, or two lines — then click to place the dimension.',
   project: 'Click an edge of the model (purple) to project it into the sketch as fixed geometry.',
 };
@@ -200,8 +201,11 @@ export class SketchEditor {
     n.onCancel = () => this.escape();
     if (this.tool === 'fillet') n.setLive({ r: this.filletRadius });
     if (this.tool === 'polygon') n.setLive({ n: this.polygonSides });
-    n.show(this.lastScreen.x, this.lastScreen.y);
+    if (this.mouseSeen) n.show(this.lastScreen.x, this.lastScreen.y);
+    else n.el.classList.add('hidden');
   }
+
+  private mouseSeen = false;
 
   // ================================================================ mutations
 
@@ -392,6 +396,7 @@ export class SketchEditor {
 
     if (this.tool === 'dimension') return this.dimensionClick(m, ev);
     if (this.tool === 'fillet') return this.filletClick(m);
+    if (this.tool === 'trim') return this.trimClick(m);
     if (this.tool === 'project') return this.projectClick(m);
 
     const snap = this.curSnap ?? this.snap(m, ev.shiftKey);
@@ -411,6 +416,10 @@ export class SketchEditor {
     const m = this.host.vp.planePoint(ev, this.frame);
     if (!m) return;
     this.mouse = m;
+    if (!this.mouseSeen) {
+      this.mouseSeen = true;
+      if (this.host.numeric.fields.length) this.host.numeric.show(this.lastScreen.x, this.lastScreen.y);
+    }
     if (this.host.numeric.visible && !this.host.numeric.focused) this.host.numeric.show(this.lastScreen.x, this.lastScreen.y);
 
     if (this.drag) return this.dragMove(ev, m);
@@ -511,6 +520,10 @@ export class SketchEditor {
   /** Called on mouse move (or numeric change) to refresh hover/preview. */
   private onMove(ev: PointerEvent | null) {
     const m = this.mouse;
+    if (this.tool === 'trim') {
+      this.drawTrimPreview(m);
+      return;
+    }
     if (this.tool === 'select' || this.tool === 'dimension' || this.tool === 'fillet') {
       const h = this.hitTest(m);
       if (h !== this.hover) {
@@ -1070,6 +1083,219 @@ export class SketchEditor {
     this.rebuild();
   }
 
+  // ================================================================ trim
+
+  private curveAt(m: Vec2): SketchCurve | null {
+    const s = this.sketch;
+    const pts = pointMap(s);
+    const tol = this.pixel() * 8;
+    let best: SketchCurve | null = null, bd = tol;
+    for (const c of s.curves) {
+      const d = distanceToCurve(m, c, pts);
+      if (d < bd) { bd = d; best = c; }
+    }
+    return best;
+  }
+
+  /** Normalised parameter of a point along a curve (line/arc: 0..1, circle: 0..1 around). */
+  private paramOn(c: SketchCurve, q: Vec2, pts: Map<string, SketchPoint>): number {
+    if (c.type === 'line') {
+      return closestOnSegment(q, P(pts.get(c.p1)!), P(pts.get(c.p2)!)).t;
+    }
+    const ctr = pts.get(c.c)!;
+    const ang = Math.atan2(q[1] - ctr.y, q[0] - ctr.x);
+    if (c.type === 'circle') return normAngle(ang) / TAU;
+    const { a0, sweep } = arcAngles(c, pts);
+    const u = normAngle(ang - a0);
+    return u > sweep + 1e-9 ? (u - sweep < TAU - u ? 1 : 0) : u / sweep;
+  }
+
+  /** Computes what a trim click at m would do. */
+  private trimPlan(m: Vec2) {
+    const c = this.curveAt(m);
+    if (!c) return null;
+    const s = this.sketch;
+    const pts = pointMap(s);
+    const ends = c.type === 'line' ? [c.p1, c.p2] : c.type === 'arc' ? [c.s, c.e] : [];
+    type Cut = { t: number; pt: Vec2; pointId?: string; curveId?: string };
+    const cuts: Cut[] = [];
+    const interior = (t: number) => (c.type === 'circle' ? true : t > 1e-6 && t < 1 - 1e-6);
+    for (const o of s.curves) {
+      if (o.id === c.id) continue;
+      for (const q of intersections(c, o, pts)) {
+        const t = this.paramOn(c, q, pts);
+        if (interior(t)) cuts.push({ t, pt: q, curveId: o.id });
+      }
+    }
+    for (const p of s.points) {
+      if (ends.includes(p.id) || (c.type !== 'line' && p.id === c.c)) continue;
+      if (distanceToCurve(P(p), c, pts) < 1e-6) {
+        const t = this.paramOn(c, P(p), pts);
+        if (interior(t)) cuts.push({ t, pt: P(p), pointId: p.id });
+      }
+    }
+    cuts.sort((a, b) => a.t - b.t);
+    // merge near-duplicates (prefer existing points)
+    const uniq: Cut[] = [];
+    for (const k of cuts) {
+      const last = uniq[uniq.length - 1];
+      if (last && Math.abs(last.t - k.t) < 1e-6) {
+        if (k.pointId && !last.pointId) uniq[uniq.length - 1] = k;
+      } else uniq.push(k);
+    }
+    const tc = this.paramOn(c, c.type === 'line' ? closestOnSegment(m, P(pts.get(c.p1)!), P(pts.get(c.p2)!)).pt : m, pts);
+    let lo = [...uniq].reverse().find((k) => k.t < tc) ?? null;
+    let hi = uniq.find((k) => k.t > tc) ?? null;
+    if (c.type === 'circle') {
+      if (uniq.length < 2) { lo = null; hi = null; }
+      else {
+        lo = lo ?? uniq[uniq.length - 1];
+        hi = hi ?? uniq[0];
+      }
+    }
+    return { c, lo, hi };
+  }
+
+  private drawTrimPreview(m: Vec2) {
+    this.clearPreview();
+    const plan = this.trimPlan(m);
+    if (!plan) return;
+    const { c, lo, hi } = plan;
+    const pts = pointMap(this.sketch);
+    let piece: Vec2[];
+    if (c.type === 'line') {
+      const a = P(pts.get(c.p1)!), b = P(pts.get(c.p2)!);
+      const at = (t: number): Vec2 => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+      piece = [at(lo?.t ?? 0), at(hi?.t ?? 1)];
+    } else {
+      const ctr = pts.get(c.c)!;
+      let a0 = 0, sw = TAU;
+      if (c.type === 'arc') ({ a0, sweep: sw } = arcAngles(c, pts));
+      let t0 = lo?.t ?? 0, t1 = hi?.t ?? 1;
+      if (c.type === 'circle' && lo && hi && t1 < t0) t1 += 1;
+      piece = [];
+      for (let i = 0; i <= 48; i++) {
+        const ang = a0 + sw * (t0 + ((t1 - t0) * i) / 48);
+        piece.push([ctr.x + c.r * Math.cos(ang), ctr.y + c.r * Math.sin(ang)]);
+      }
+    }
+    this.preview.add(polyLine(piece, COLORS.conflict));
+  }
+
+  private trimClick(m: Vec2) {
+    const plan = this.trimPlan(m);
+    if (!plan) return;
+    const { c, lo, hi } = plan;
+    if (!lo && !hi) {
+      this.sel = new Set([c.id]);
+      this.deleteSelection();
+      this.clearPreview();
+      return;
+    }
+    this.edit('sketch', (s) => {
+      const cur = s.curves.find((x) => x.id === c.id)!;
+      const mk = (k: NonNullable<typeof lo>): string => {
+        if (k.pointId) return k.pointId;
+        const ex = s.points.find((p) => dist(P(p), k.pt) < 1e-6);
+        if (ex) return ex.id;
+        const id = this.nid('p');
+        s.points.push({ id, x: k.pt[0], y: k.pt[1] });
+        if (k.curveId) s.constraints.push({ id: this.nid('c'), type: 'pointOnCurve', refs: [id, k.curveId] });
+        return id;
+      };
+      // constraints that no longer make sense on a shortened curve
+      s.constraints = s.constraints.filter((k) => !(k.refs.includes(c.id) && (k.type === 'equal' && cur.type === 'line' || (k.type === 'distance' && k.refs.length === 1) || k.type === 'midpoint')));
+      if (cur.type === 'line') {
+        if (!lo) cur.p1 = mk(hi!);
+        else if (!hi) cur.p2 = mk(lo);
+        else {
+          const nid = this.nid('l');
+          const oldP2 = cur.p2;
+          const h = mk(hi);
+          s.curves.push({ id: nid, type: 'line', p1: h, p2: oldP2, construction: cur.construction });
+          cur.p2 = mk(lo);
+          // keep both pieces collinear
+          s.constraints.push({ id: this.nid('c'), type: 'pointOnCurve', refs: [h, c.id] });
+          s.constraints.push({ id: this.nid('c'), type: 'pointOnCurve', refs: [oldP2, c.id] });
+        }
+      } else if (cur.type === 'arc') {
+        if (!lo) cur.s = mk(hi!);
+        else if (!hi) cur.e = mk(lo);
+        else {
+          const nid = this.nid('a');
+          s.curves.push({ id: nid, type: 'arc', c: cur.c, s: mk(hi), e: cur.e, r: cur.r, construction: cur.construction });
+          cur.e = mk(lo);
+          s.constraints.push({ id: this.nid('c'), type: 'equal', refs: [c.id, nid] });
+        }
+      } else {
+        const idx = s.curves.indexOf(cur);
+        s.curves[idx] = { id: cur.id, type: 'arc', c: cur.c, s: mk(hi!), e: mk(lo!), r: cur.r, construction: cur.construction };
+      }
+      // drop orphaned points
+      const used = new Set<string>();
+      for (const k of s.curves) (k.type === 'line' ? [k.p1, k.p2] : k.type === 'circle' ? [k.c] : [k.c, k.s, k.e]).forEach((p) => used.add(p));
+      const orphan = new Set(s.points.filter((p) => !used.has(p.id) && p.id !== ORIGIN_ID && (p.id === (c as any).p1 || p.id === (c as any).p2 || p.id === (c as any).s || p.id === (c as any).e)).map((p) => p.id));
+      s.points = s.points.filter((p) => !orphan.has(p.id));
+      s.constraints = s.constraints.filter((k) => !k.refs.some((r) => orphan.has(r)));
+    });
+    this.clearPreview();
+    this.rebuild();
+  }
+
+  // ================================================================ mirror
+
+  /** Mirrors the selected curves about a selected line (construction line preferred). */
+  mirrorSelection() {
+    const s = this.sketch;
+    const ids = [...this.sel];
+    const lines = ids.map((id) => s.curves.find((c) => c.id === id)).filter((c): c is Extract<SketchCurve, { type: 'line' }> => c?.type === 'line');
+    const axis = [...lines].reverse().find((l) => l.construction) ?? lines[lines.length - 1];
+    const targets = ids.map((id) => s.curves.find((c) => c.id === id)).filter((c): c is SketchCurve => !!c && c !== axis);
+    if (!axis || !targets.length) return this.host.toast('Select the curves to mirror and a mirror line (last selected or construction)', 'err');
+    const pts = pointMap(s);
+    const A = P(pts.get(axis.p1)!), B = P(pts.get(axis.p2)!);
+    const d = norm(sub(B, A));
+    const reflect = (q: Vec2): Vec2 => {
+      const v = sub(q, A);
+      const t = v[0] * d[0] + v[1] * d[1];
+      const foot = add(A, scale(d, t));
+      return sub(scale(foot, 2), q);
+    };
+    const onAxis = (q: Vec2) => Math.abs((q[0] - A[0]) * d[1] - (q[1] - A[1]) * d[0]) < 1e-6;
+    this.edit('sketch', (sk) => {
+      const map = new Map<string, string>();
+      const mp = (id: string) => {
+        if (map.has(id)) return map.get(id)!;
+        const p = pts.get(id)!;
+        if (onAxis(P(p))) {
+          map.set(id, id);
+          return id;
+        }
+        const r = reflect(P(p));
+        const nid = this.nid('p');
+        sk.points.push({ id: nid, x: r[0], y: r[1] });
+        this.con(sk, 'symmetric', [id, nid, axis.id]);
+        map.set(id, nid);
+        return nid;
+      };
+      for (const c of targets) {
+        if (c.type === 'line') sk.curves.push({ id: this.nid('l'), type: 'line', p1: mp(c.p1), p2: mp(c.p2), construction: c.construction });
+        else if (c.type === 'circle') {
+          const nid = this.nid('k');
+          sk.curves.push({ id: nid, type: 'circle', c: mp(c.c), r: c.r, construction: c.construction });
+          this.con(sk, 'equal', [c.id, nid]);
+        } else {
+          const nid = this.nid('a');
+          sk.curves.push({ id: nid, type: 'arc', c: mp(c.c), s: mp(c.e), e: mp(c.s), r: c.r, construction: c.construction });
+          this.con(sk, 'equal', [c.id, nid]);
+        }
+      }
+    });
+    this.sel.clear();
+    this.host.onSelection();
+    this.rebuild();
+  }
+
   // ================================================================ project
 
   computeRefs() {
@@ -1465,6 +1691,24 @@ export class SketchEditor {
       e.stopPropagation();
       if (DIMENSION_TYPES.includes(c.type)) this.openDimEditor(c.id);
     });
+  }
+
+  /** True while a drawing operation or dimension pick is in progress. */
+  get busy() {
+    return this.clicks.length > 0 || this.dimRefs.length > 0 || !!this.drag;
+  }
+
+  /** Center and radius of the sketch contents (or the face it sits on) in sketch coordinates. */
+  contentBounds(): { center: Vec2; radius: number } {
+    const s = this.sketch;
+    const pts: Vec2[] = [];
+    const map = pointMap(s);
+    for (const c of s.curves) pts.push(...tessellate(c, map));
+    if (!pts.length) for (const seg of this.refSegments) pts.push(seg[0], seg[1]);
+    if (!pts.length) return { center: [0, 0], radius: 50 };
+    const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+    const c: Vec2 = [(Math.min(...xs) + Math.max(...xs)) / 2, (Math.min(...ys) + Math.max(...ys)) / 2];
+    return { center: c, radius: Math.max(5, Math.hypot(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)) / 2) };
   }
 
   /** Info for the status bar. */

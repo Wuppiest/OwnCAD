@@ -103,6 +103,8 @@ export interface ExtrudeFeature extends FeatureBase {
   taper?: Expr;
   op: BodyOp;
   target: string; // body id or 'auto'
+  /** Selected sketch regions (indices from findRegions). Empty/undefined = all loops, nested ones become holes. */
+  profiles?: number[];
 }
 
 export interface RevolveFeature extends FeatureBase {
@@ -113,6 +115,7 @@ export interface RevolveFeature extends FeatureBase {
   angle: Expr;
   op: BodyOp;
   target: string;
+  profiles?: number[];
 }
 
 export interface PrimitiveFeature extends FeatureBase {

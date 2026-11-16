@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { evaluate, ParamScope } from '../src/model/expr';
-import { findProfiles } from '../src/sketch/profiles';
+import { findProfiles, findRegions } from '../src/sketch/profiles';
 import { createEmptyDocument, parseDocument } from '../src/model/document';
 import type { SketchFeature } from '../src/model/types';
 
@@ -84,6 +84,63 @@ describe('profiles', () => {
     const r = findProfiles(s);
     expect(r.loops.length).toBe(1);
     expect(Math.abs(area(r.loops[0]))).toBeCloseTo(100);
+  });
+});
+
+describe('intersections', () => {
+  it('splits regions at T-junctions (line ending on another line)', () => {
+    const s = sketch(
+      [['a', 0, 0], ['b', 40, 0], ['c', 40, 20], ['d', 0, 20], ['m1', 20, 0], ['m2', 20, 20]],
+      [['a', 'b'], ['b', 'c'], ['c', 'd'], ['d', 'a'], ['m1', 'm2']],
+    );
+    const r = findRegions(s);
+    expect(r.length).toBe(2);
+    r.forEach((x) => expect(x.area).toBeCloseTo(400));
+  });
+  it('splits regions where lines cross without shared points', () => {
+    const s = sketch(
+      [['a', 0, 0], ['b', 40, 0], ['c', 40, 20], ['d', 0, 20], ['x1', 20, -5], ['x2', 20, 25], ['y1', -5, 10], ['y2', 45, 10]],
+      [['a', 'b'], ['b', 'c'], ['c', 'd'], ['d', 'a'], ['x1', 'x2'], ['y1', 'y2']],
+    );
+    const r = findRegions(s);
+    expect(r.length).toBe(4);
+    r.forEach((x) => expect(x.area).toBeCloseTo(200));
+  });
+  it('splits a circle crossed by a line', () => {
+    const s = sketch([['o', 0, 0], ['p', -20, 0], ['q', 20, 0]], [['p', 'q']]);
+    s.curves.push({ id: 'k', type: 'circle', c: 'o', r: 10 });
+    const r = findRegions(s);
+    expect(r.length).toBe(2);
+    const total = r.reduce((a, x) => a + x.area, 0);
+    expect(total).toBeCloseTo(Math.PI * 100, 0);
+  });
+});
+
+describe('regions', () => {
+  it('splits a rectangle with a hole into "rect minus circle" and "circle"', () => {
+    const s = sketch([['a', 0, 0], ['b', 40, 0], ['c', 40, 20], ['d', 0, 20], ['o', 20, 10]], [['a', 'b'], ['b', 'c'], ['c', 'd'], ['d', 'a']]);
+    s.curves.push({ id: 'k', type: 'circle', c: 'o', r: 5 });
+    const r = findRegions(s);
+    expect(r.length).toBe(2);
+    const areas = r.map((x) => x.area).sort((p, q) => p - q);
+    expect(areas[0]).toBeCloseTo(Math.PI * 25, 0);
+    expect(areas[1]).toBeCloseTo(800 - Math.PI * 25, 0);
+    const outer = r.find((x) => x.polys.length === 2)!;
+    expect(outer).toBeDefined();
+    // label point lies inside the region, outside the hole
+    expect(Math.hypot(outer.label[0] - 20, outer.label[1] - 10)).toBeGreaterThan(5);
+  });
+  it('treats side-by-side regions independently', () => {
+    const s = sketch(
+      [['a', 0, 0], ['b', 20, 0], ['c', 40, 0], ['d', 40, 20], ['e', 20, 20], ['f', 0, 20]],
+      [['a', 'b'], ['b', 'c'], ['c', 'd'], ['d', 'e'], ['e', 'f'], ['f', 'a'], ['b', 'e']],
+    );
+    const r = findRegions(s);
+    expect(r.length).toBe(2);
+    r.forEach((x) => {
+      expect(x.polys.length).toBe(1);
+      expect(x.area).toBeCloseTo(400);
+    });
   });
 });
 

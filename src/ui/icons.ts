@@ -42,6 +42,7 @@ const I: Record<string, string> = {
   polygon: '<path d="M12 3l8 5v8l-8 5-8-5V8z"/>',
   point: '<circle cx="12" cy="12" r="2.5"/><path d="M12 4v4M12 16v4M4 12h4M16 12h4"/>',
   fillet: '<path d="M4 4v8a8 8 0 008 8h8"/>',
+  trim: '<path d="M3 12h6M15 12h6" /><path d="M9 12h6" stroke-dasharray="1.5 1.5"/><circle cx="7" cy="18" r="2"/><circle cx="17" cy="18" r="2"/><path d="M8.5 16.5L15 6M15.5 16.5L9 6"/>',
   project: '<path d="M4 14l8 4 8-4M12 4v10"/><path d="M9 11l3 3 3-3"/>',
   dimension: '<path d="M4 8v8M20 8v8M4 12h16M7 10l-3 2 3 2M17 10l3 2-3 2"/>',
   coincident: '<circle cx="12" cy="12" r="3"/><path d="M3 12h6M15 12h6"/>',

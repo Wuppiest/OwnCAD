@@ -82,9 +82,11 @@ export class Viewport {
 
     new ResizeObserver(() => this.resize()).observe(host);
     this.resize();
+    this.updateGrid();
     const loop = () => {
       requestAnimationFrame(loop);
       this.controls.update();
+      this.updateGrid();
       this.renderer.render(this.scene, this.camera);
       for (const h of this.frameHooks) h();
     };
@@ -96,7 +98,7 @@ export class Viewport {
     c.enableDamping = false;
     c.zoomToCursor = true;
     c.screenSpacePanning = true;
-    c.mouseButtons = { LEFT: null as any, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.ROTATE };
+    c.mouseButtons = { LEFT: this.leftOrbit ? THREE.MOUSE.ROTATE : (null as any), MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.ROTATE };
     c.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_PAN };
     c.rotateSpeed = 0.8;
     this.renderer.domElement.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -105,6 +107,13 @@ export class Viewport {
 
   onFrame(h: () => void) {
     this.frameHooks.push(h);
+  }
+
+  /** Left mouse drag orbits (model mode); in sketch mode the left button draws. Shift/Ctrl + left drag pans. */
+  leftOrbit = true;
+  setLeftOrbit(on: boolean) {
+    this.leftOrbit = on;
+    this.controls.mouseButtons.LEFT = on ? THREE.MOUSE.ROTATE : (null as any);
   }
 
   resize() {
@@ -170,15 +179,59 @@ export class Viewport {
     return g;
   }
 
-  setGrid(size: number, step: number, frame?: Frame) {
+  private gridFrame: Frame | undefined;
+  private gridKey = '';
+  gridVisible = true;
+
+  /** Sets the plane the grid lies on; spacing and extent adapt to the zoom level automatically. */
+  setGrid(frame?: Frame) {
+    this.gridFrame = frame;
+    this.gridKey = '';
+    this.updateGrid();
+  }
+
+  private updateGrid() {
+    const f = this.gridFrame ?? { origin: [0, 0, 0], x: [1, 0, 0], y: [0, 1, 0], z: [0, 0, 1] } as Frame;
+    const target = this.controls.target;
+    const px = this.pixelSize(target) || 0.1;
+    // major spacing: smallest power of 10 that is at least ~50 px on screen
+    const major = Math.pow(10, Math.ceil(Math.log10(Math.max(px * 50, 1e-3))));
+    // center the grid near the view target (snapped to major lines), in plane coordinates
+    const o = new THREE.Vector3(...f.origin);
+    const rel = target.clone().sub(o);
+    const cx = Math.round(rel.dot(new THREE.Vector3(...f.x)) / (major * 10)) * major * 10;
+    const cy = Math.round(rel.dot(new THREE.Vector3(...f.y)) / (major * 10)) * major * 10;
+    const key = `${major}|${cx}|${cy}|${f.origin}|${f.z}`;
+    if (key === this.gridKey) return;
+    this.gridKey = key;
     this.scene.remove(this.grid);
-    this.grid = this.makeGrid(size, step);
-    if (frame) {
-      const m = new THREE.Matrix4().makeBasis(new THREE.Vector3(...frame.x), new THREE.Vector3(...frame.y), new THREE.Vector3(...frame.z));
-      m.setPosition(...frame.origin);
-      this.grid.applyMatrix4(m);
+    this.grid.traverse((g) => (g as any).geometry?.dispose?.());
+    const size = major * 80;
+    const g = new THREE.Group();
+    const minor = new THREE.GridHelper(size, 400, 0x3c4554, 0x3c4554);
+    const maj = new THREE.GridHelper(size, 80, 0x56627a, 0x56627a);
+    for (const h of [minor, maj]) {
+      h.rotation.x = Math.PI / 2;
+      const mat = h.material as THREE.Material;
+      mat.transparent = true;
+      mat.opacity = h === minor ? 0.3 : 0.6;
+      mat.depthWrite = false;
     }
+    g.add(minor, maj);
+    g.position.set(cx, cy, 0);
+    const wrap = new THREE.Group();
+    wrap.add(g);
+    const m = new THREE.Matrix4().makeBasis(new THREE.Vector3(...f.x), new THREE.Vector3(...f.y), new THREE.Vector3(...f.z));
+    m.setPosition(...f.origin);
+    wrap.applyMatrix4(m);
+    wrap.visible = this.gridVisible;
+    this.grid = wrap;
     this.scene.add(this.grid);
+  }
+
+  setGridVisible(v: boolean) {
+    this.gridVisible = v;
+    this.grid.visible = v;
   }
 
   private makeAxes() {
@@ -258,7 +311,8 @@ export class Viewport {
     for (const { s, frame } of sketches) {
       const pts = pointMap(s);
       for (const c of s.curves) {
-        const poly = tessellate(c, pts).map((p) => new THREE.Vector3(...toWorld(frame, p)));
+        // lifted slightly off the plane so lines on a face don't z-fight
+        const poly = tessellate(c, pts).map((p) => new THREE.Vector3(...toWorld(frame, p, 0.01)));
         const geo = new THREE.BufferGeometry().setFromPoints(poly);
         const mat = c.construction
           ? new THREE.LineDashedMaterial({ color: 0x9ca3af, dashSize: 2, gapSize: 1.5 })
@@ -269,6 +323,37 @@ export class Viewport {
         this.sketchesGroup.add(line);
       }
     }
+  }
+
+  // ------------------------------------------------------------ profile regions (for extrude/revolve)
+
+  regionsGroup = new THREE.Group();
+
+  setRegions(frame: Frame | null, regions: { polys: Vec2[][]; label: Vec2 }[], selected: Set<number>, allSelected: boolean) {
+    this.regionsGroup.traverse((o) => (o as any).geometry?.dispose?.());
+    this.regionsGroup.clear();
+    if (!this.regionsGroup.parent) this.scene.add(this.regionsGroup);
+    if (!frame) return;
+    const m = new THREE.Matrix4().makeBasis(new THREE.Vector3(...frame.x), new THREE.Vector3(...frame.y), new THREE.Vector3(...frame.z));
+    m.setPosition(...toWorld(frame, [0, 0], 0.02));
+    regions.forEach((r, i) => {
+      const shape = new THREE.Shape(r.polys[0].map((p) => new THREE.Vector2(p[0], p[1])));
+      for (const h of r.polys.slice(1)) shape.holes.push(new THREE.Path(h.map((p) => new THREE.Vector2(p[0], p[1]))));
+      const on = allSelected || selected.has(i);
+      const mesh = new THREE.Mesh(
+        new THREE.ShapeGeometry(shape),
+        new THREE.MeshBasicMaterial({ color: on ? 0x3b82f6 : 0x94a3b8, transparent: true, opacity: on ? 0.4 : 0.15, side: THREE.DoubleSide, depthWrite: false, depthTest: false }),
+      );
+      mesh.applyMatrix4(m);
+      mesh.userData.regionIndex = i;
+      mesh.renderOrder = 8;
+      this.regionsGroup.add(mesh);
+    });
+  }
+
+  pickRegion(ev: { clientX: number; clientY: number }): number | null {
+    const hits = this.ray(ev).intersectObjects(this.regionsGroup.children, false);
+    return hits.length ? hits[0].object.userData.regionIndex : null;
   }
 
   // ------------------------------------------------------------ origin planes
@@ -428,29 +513,37 @@ export class Viewport {
 
   // ------------------------------------------------------------ views
 
-  setView(dir: THREE.Vector3, up?: THREE.Vector3, animate = true) {
-    const target = this.controls.target.clone();
-    const dist = this.camera.position.distanceTo(target);
+  setView(dir: THREE.Vector3, up?: THREE.Vector3, animate = true, frameTo?: { center: THREE.Vector3; radius: number }) {
+    const startTarget = this.controls.target.clone();
+    const startOffset = this.camera.position.clone().sub(startTarget);
+    const startDist = startOffset.length();
+    let target = startTarget.clone();
+    let dist = startDist;
+    if (frameTo) {
+      target = frameTo.center.clone();
+      dist = (Math.max(frameTo.radius, 5) / Math.sin(THREE.MathUtils.degToRad(this.persp.fov / 2))) * 1.1;
+      if (this.isOrtho) this.ortho.zoom = 1;
+    }
     const d = dir.clone().normalize();
     // avoid exact pole (OrbitControls uses world Z up)
     if (Math.abs(d.z) > 0.9999) d.y -= up && up.y < 0 ? -1e-4 : 1e-4;
-    const endPos = target.clone().add(d.normalize().multiplyScalar(dist));
-    if (!animate) {
-      this.camera.position.copy(endPos);
-      this.camera.lookAt(target);
+    d.normalize();
+    const apply = (k: number) => {
+      const tgt = startTarget.clone().lerp(target, k);
+      const dirK = startOffset.clone().normalize().lerp(d, k);
+      if (dirK.lengthSq() < 1e-8) dirK.copy(d);
+      dirK.normalize().multiplyScalar(startDist + (dist - startDist) * k);
+      this.controls.target.copy(tgt);
+      this.camera.position.copy(tgt).add(dirK);
+      this.camera.lookAt(tgt);
       this.controls.update();
       this.updateOrthoFrustum();
-      return;
-    }
-    const startPos = this.camera.position.clone();
+    };
+    if (!animate) return apply(1);
     const t0 = performance.now();
     const step = () => {
       const t = Math.min(1, (performance.now() - t0) / 250);
-      const k = t * (2 - t);
-      const v = startPos.clone().sub(target).lerp(endPos.clone().sub(target), k).setLength(dist);
-      this.camera.position.copy(target).add(v);
-      this.camera.lookAt(target);
-      this.controls.update();
+      apply(t * (2 - t));
       if (t < 1) requestAnimationFrame(step);
     };
     step();
