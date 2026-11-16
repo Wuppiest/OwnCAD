@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>OwnCAD</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M4 10l12-6 12 6v12l-12 6-12-6z' fill='%233b82f6'/%3E%3Cpath d='M4 10l12 6 12-6M16 16v12' stroke='%23fff' stroke-width='1.5' fill='none'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <div id="app">
+      <header id="topbar">
+        <div class="brand"><span class="logo"></span>OwnCAD</div>
+        <nav id="ribbon-tabs"></nav>
+        <div id="doc-title"></div>
+      </header>
+      <div id="ribbon"></div>
+      <main id="workspace">
+        <aside id="left-panel">
+          <div class="panel-tabs">
+            <button data-tab="tree" class="active">Browser</button>
+            <button data-tab="params">Parameters</button>
+          </div>
+          <div id="tree-panel" class="panel-body"></div>
+          <div id="params-panel" class="panel-body hidden"></div>
+        </aside>
+        <section id="viewport">
+          <div id="canvas-host"></div>
+          <div id="viewcube-host"></div>
+          <div id="view-buttons"></div>
+          <div id="sketch-banner" class="hidden"></div>
+          <div id="numeric-input" class="hidden"></div>
+          <div id="toast-host"></div>
+        </section>
+        <aside id="right-panel">
+          <div class="panel-title">Properties</div>
+          <div id="props-panel" class="panel-body"></div>
+        </aside>
+      </main>
+      <footer id="statusbar"></footer>
+    </div>
+    <div id="loading">Loading geometry kernel…</div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
